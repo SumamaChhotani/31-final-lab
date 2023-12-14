@@ -1,0 +1,611 @@
+/*
+ * Swarthmore College, CS 31
+ * Copyright (c) 2023 Swarthmore College Computer Science Department,
+ * Swarthmore PA
+ */
+
+// This program reads from files in order to play Conway's Game of Life.
+// It can be printed to the terminal or run in ParaVisi.
+
+/*
+ * To run:
+ * ./gol file1.txt  0  # run with config file file1.txt, do not print board
+ * ./gol file1.txt  1  # run with config file file1.txt, ascii animation
+ * ./gol file1.txt  2  # run with config file file1.txt, ParaVis animation
+ *
+ */
+#include <pthreadGridVisi.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <time.h>
+#include <string.h>
+#include <pthread.h>
+#include "colors.h"
+
+/****************** Definitions **********************/
+/* Three possible modes in which the GOL simulation can run */
+#define OUTPUT_NONE   (0)   // with no animation
+#define OUTPUT_ASCII  (1)   // with ascii animation
+#define OUTPUT_VISI   (2)   // with ParaVis animation
+
+/* Used to slow down animation run modes: usleep(SLEEP_USECS);
+ * Change this value to make the animation run faster or slower
+ */
+//#define SLEEP_USECS  (1000000)
+#define SLEEP_USECS    (100000)
+
+/* A global variable to keep track of the number of live cells in the
+ * world (this is the ONLY global variable you may use in your program)
+ */
+static int total_live = 0;
+static pthread_mutex_t cerberus;
+static pthread_barrier_t myrmidon;
+
+/* This struct represents all the data you need to keep track of your GOL
+ * simulation.  Rather than passing individual arguments into each function,
+ * we'll pass in everything in just one of these structs.
+ * this is passed to play_gol, the main gol playing loop
+ *
+ * NOTE: You will need to use the provided fields here, but you'll also
+ *       need to add additional fields. (note the nice field comments!)
+ * NOTE: DO NOT CHANGE THE NAME OF THIS STRUCT!!!!
+ */
+struct gol_data {
+
+    // NOTE: DO NOT CHANGE the names of these 4 fields (but USE them)
+    int rows;  // the row dimension
+    int cols;  // the column dimension
+    int iters; // number of iterations to run the gol simulation
+    int output_mode; // set to:  OUTPUT_NONE, OUTPUT_ASCII, or OUTPUT_VISI
+    int live; // num of live cells
+    int mode; // 0 for row, 1 for column
+    int rowStart; // starting row
+    int colStart; // starting column
+    int myRows; // how many rows to look at
+    int myCols; // how many columns to look at
+    int numThreads; // how many threads total (for ParaVisi)
+    int logId; // logical thread id
+    int printfo; // print thread info?
+    int *board; // holds entire board!!
+    int *futureBoard; // holds next board
+
+    /* fields used by ParaVis library (when run in OUTPUT_VISI mode). */
+    // NOTE: DO NOT CHANGE their definitions BUT USE these fields
+    visi_handle handle;
+    color3 *image_buff;
+};
+
+
+/****************** Function Prototypes **********************/
+/* the main gol game playing loop (prototype must match this) */
+void *play_gol(void *args);
+
+// sets futureBoard to the next iteration
+int set_next(struct gol_data *data);
+
+/* init gol data from the input file and run mode cmdline args */
+int init_game_data_from_args(struct gol_data *data, char **argv);
+
+// A mostly implemented function, but a bit more for you to add.
+/* print board to the terminal (for OUTPUT_ASCII mode) */
+void print_board(struct gol_data *data, int round);
+
+// Main VISI Function
+void simulation(struct gol_data *data);
+
+
+/************ Definitions for using ParVisi library ***********/
+/* initialization for the ParaVisi library (DO NOT MODIFY) */
+int setup_animation(struct gol_data* data);
+/* register animation with ParaVisi library (DO NOT MODIFY) */
+int connect_animation(void (*applfunc)(struct gol_data *data),
+        struct gol_data* data);
+/* name for visi (you may change the string value if you'd like) */
+static char visi_name[] = "GOL!";
+
+
+int main(int argc, char **argv) {
+
+    int ret, threads, i, tokens, debut;
+    struct gol_data data;
+    struct gol_data *arghold;
+    //struct timeval start, end;
+    pthread_t *threadhold;
+
+    /* check number of command line arguments */
+    if (argc < 5) {
+        printf("usage: %s <infile.txt> <output_mode>[0|1|2]\n", argv[0]);
+        printf("(0: no visualization, 1: ASCII, 2: ParaVisi)\n");
+        exit(1);
+    }
+
+    /* Initialize game state (all fields in data) from information
+     * read from input file */
+    
+    ret = init_game_data_from_args(&data, argv);
+    
+   
+
+    if (ret != 0) {
+        printf("Initialization error: file %s, mode %s\n", argv[1], argv[2]);
+        exit(1);
+    }
+
+    // how many rows/columns?
+    threads = atoi(argv[3]);
+    data.numThreads = threads;
+    threadhold = malloc(sizeof(pthread_t) * threads);
+    arghold = malloc(sizeof(struct gol_data) * threads);
+    // 0 = rows, 1 = columns
+    data.mode = atoi(argv[4]);
+    data.printfo = atoi(argv[5]);
+
+     // Initialize the mutex
+    if (pthread_mutex_init(&cerberus, NULL)) { 
+        printf("pthread_mutex_init error\n");
+        exit(1);
+    }
+    
+    // Initialize the barrier with num threads that will be synchronized
+    if (pthread_barrier_init(&myrmidon, 0, (threads))) {
+        printf("pthread_barrier_init error\n");
+        exit(1);
+    }
+
+    /* initialize ParaVisi animation (if applicable) */
+    if (data.output_mode == OUTPUT_VISI) {
+        setup_animation(&data);
+    }
+
+    // if in row mode...
+    if (data.mode == 0) {
+        // check if the user wants too many threads
+        if (data.rows < threads) {
+            printf("More threads than rows!\n");
+            exit(1);
+        }
+        data.myCols = data.cols;
+        data.colStart = 0;
+        // tokens add extra rows when the threads don't divide in cleanly
+        tokens = (data.rows % threads);
+        debut = 0;
+        for (i = 0; i < threads; i++) {
+            data.logId = i;
+            data.rowStart = debut;
+            if (tokens > 0)  {
+                // add extra row if tokens are available
+                data.myRows = (data.rows / threads) + 1;
+                tokens--;
+            }
+            else {
+                // else, partition normal amount
+                data.myRows = (data.rows / threads);
+            }
+            // increase index where we're setting rows from
+            debut = debut + (data.myRows);
+            // set struct array
+            arghold[i] = data;
+            // create the thread!
+            ret = pthread_create(&threadhold[i], NULL, play_gol, &arghold[i]);
+            if (ret) { 
+                perror("Error: pthread_create"); exit(1); 
+            }
+        }
+    }
+    // if in column mode...
+    else {
+        // check if the user wants too many threads
+        if (data.cols < threads) {
+            printf("More threads than cols!\n");
+            exit(1);
+        }
+        data.myRows = data.rows;
+        data.rowStart = 0;
+        // tokens add extra cols when the threads don't divide in cleanly
+        tokens = (data.cols % threads);
+        debut = 0;
+        for (i = 0; i < threads; i++) {
+            data.logId = i;
+            data.colStart = debut;
+            if (tokens > 0)  {
+                // add extra col if tokens are available
+                data.myCols = (data.cols / threads) + 1;
+                tokens--;
+            }
+            else {
+                // else, partition normal amount
+                data.myCols = (data.cols / threads);
+            }
+            // increase index where we're setting cols from
+            debut = debut + (data.myCols);
+            // set struct array
+            arghold[i] = data;
+            // create the thread!
+            ret = pthread_create(&threadhold[i], NULL, play_gol, &arghold[i]);
+            if (ret) { 
+                perror("Error: pthread_create"); exit(1); 
+            }
+        }
+    }
+    
+    // start the visi animation (if applicable)
+    if (data.output_mode == OUTPUT_VISI) {
+        run_animation(data.handle, data.iters);
+    }
+
+    // Clean up, clean up, everybody everywhere
+    for (i = 0; i < threads; i++) {
+        // wait for threads to finish, join them when they do
+        pthread_join(threadhold[i], NULL);
+    }
+
+    free(data.board);
+    free(data.futureBoard);
+    free(arghold);
+    free(threadhold);
+
+    if (pthread_mutex_destroy(&cerberus)) {
+        printf("Ack! Mutex Destroy Error!\n");
+        exit(1);
+    }
+
+    if (pthread_barrier_destroy(&myrmidon)) {
+        printf("Aah! Barrier Destroy Error!\n");
+        exit(1);
+    }
+
+    return 0;
+}
+
+
+// Update the picture in the visi window. Accepts a gol_data struct,
+// which is our overarching gol holder.
+void simulation(struct gol_data *data) {
+
+    int i, j, r, c, index, buff_i;
+    color3 *buff;
+
+    buff = data->image_buff;  // just for readability
+    r = data->rows;
+    c = data->cols;
+
+    for (i = (data->rowStart); i < ((data->rowStart) + (data->myRows)); i++) {
+        for (j = data->colStart; j < ((data->colStart) + (data->myCols)); j++) {
+            index = i*c + j;
+            // translate row index to y-coordinate value because in
+            // the image buffer, (r,c)=(0,0) is the _lower_ left but
+            // in the board, (r,c)=(0,0) is _upper_ left.
+            buff_i = (r - (i+1))*c + j;
+
+            // update animation buffer
+            if (data->board[index] == 0) {
+                buff[buff_i] = colors[((data->logId)%8)];
+            } else {
+                buff[buff_i] = c3_white;
+            }
+        }
+    }
+    draw_ready(data->handle);
+    usleep(SLEEP_USECS);
+}
+
+
+/* initialize the gol game state from command line arguments
+ *       argv[1]: name of file to read game config state from
+ *       argv[2]: run mode value
+ * data: pointer to gol_data struct to initialize
+ * argv: command line args
+ *       argv[1]: name of file to read game config state from
+ *       argv[2]: run mode
+ * returns: 0 on success, 1 on error
+ */
+int init_game_data_from_args(struct gol_data *data, char **argv) {
+    // file to scan from
+    FILE *infile;
+    int num, rowNum, colNum, numIters, cellNum, rowLook, colLook, i, j;
+
+    data->output_mode = atoi(argv[2]);
+
+    infile = fopen(argv[1], "r");
+
+    if(infile == NULL) {
+        printf("FILE ERROR!!!\n");
+        exit(1);
+    }
+
+    // Scan relevant data in from file
+    num = fscanf(infile, "%d%d%d%d", &rowNum, &colNum, &numIters, &cellNum);
+    if (num != 4) {
+        printf("SCAN ERROR!! AHH!");
+        exit(1);
+    }
+
+    // malloc board and future board
+    data->board = malloc((sizeof(int) * colNum * rowNum));
+    data->futureBoard = malloc((sizeof(int) * colNum * rowNum));
+
+    for(i = 0; i < rowNum; i++) {
+        for(j = 0; j < colNum; j++) {
+            // assume 0 (dead) to start
+            (data->board)[(i * colNum) + j] = 0;
+        }
+    }    
+
+    for(i = 0; i < rowNum; i++) {
+        for(j = 0; j < colNum; j++) {
+            // assume 0 (dead) to start
+            (data->futureBoard)[(i * colNum) + j] = 0;
+        }
+    }  
+
+    // if coords are found in file, set cell to alive
+    for (i = 0; i < cellNum; i++) {
+        num = fscanf(infile, "%d%d", &rowLook, &colLook);
+        if (num != 2) {
+            printf("SCAN ERROR!! AHH!\n");
+            exit(1);
+        }
+        // Rise! Rise from your grave!
+        (data->board)[(colNum * rowLook) + colLook] = 1;
+    }
+
+    // set struct values
+    data->rows = rowNum;
+    data->cols = colNum;
+    data->iters = numIters;
+    
+    return 0;
+}
+
+
+/* the gol application main loop function:
+ *  runs rounds of GOL,
+ *    * updates program state for next round (world and total_live)
+ *    * performs any animation step based on the output/run mode
+ *
+ *   data: pointer to a struct gol_data  initialized with
+ *         all GOL game playing state
+ */
+void *play_gol(void *args) {
+    struct timeval start, end;
+    // wait for all threads to arrive to start
+    pthread_barrier_wait(&myrmidon);
+    
+    struct gol_data *data;
+    data = (struct gol_data *)args;
+    int i, j;
+    double secs;
+    // thread 0 watches the time
+    if(data->logId == 0) {
+        gettimeofday(&start, NULL);
+    }
+    //  at the end of each round of GOL, determine if there is an
+    //  animation step to take based on the output_mode,
+    //   if ascii animation:
+    //     (a) call system("clear") to clear previous world state from terminal
+    //     (b) call print_board function to print current world state
+    //     (c) call usleep(SLEEP_USECS) to slow down the animation
+
+    if (data->output_mode == OUTPUT_ASCII) {
+        if (system("clear")) { perror("clear"); exit(1); }
+        
+        if(data->logId == 0 && data->output_mode == OUTPUT_ASCII) {
+            system("clear");
+            print_board(data, 0);
+        }
+        pthread_barrier_wait(&myrmidon);
+    }
+    
+    if (data->output_mode != OUTPUT_VISI) {
+        for (i = 1; i <= data->iters; i++){
+            if(data->logId == 0) {
+                // reset live cells at the beginning of each round
+                total_live = 0;
+            }
+            // don't start setting before live_cells is set
+            pthread_barrier_wait(&myrmidon);
+            set_next(data);
+            pthread_barrier_wait(&myrmidon);
+            // only want to print board once, so only thread 0 does it
+            if(data->logId == 0) {
+                // update board based on set futureBoard
+                for (j = 0; j < (data->rows * data->cols); j++){
+                    data->board[j] = data->futureBoard[j];
+                }
+                if (data->output_mode == OUTPUT_ASCII) {
+                    system("clear");
+                    print_board(data, i);
+                }
+            }
+            pthread_barrier_wait(&myrmidon);
+            if (data->output_mode != OUTPUT_NONE) {
+                usleep(SLEEP_USECS);
+            }
+        }
+        // print elapsed time at end (again, thread 0)
+        if(data->logId == 0) {
+            gettimeofday(&end, NULL);
+            secs = (double)((end.tv_sec - start.tv_sec) + (end.tv_usec - start.tv_usec)/1000000.0);
+
+            /* Print the total runtime, in seconds. */
+            // NOTE: do not modify these calls to fprintf
+            fprintf(stdout, "Total time: %0.8f seconds\n", secs);
+            fprintf(stdout, "Number of cells after %d rounds on %dx%d: %d\n\n",
+            data->iters, data->rows, data->cols, total_live);
+        }
+        // so time print doesn't get "sandwich'd" between thread info
+        pthread_barrier_wait(&myrmidon);
+        // If last cmdline arg was 1, print thread info after running function
+        if (data->printfo == 1) {
+            printf("LogID: %d My Rows: %d:%d (%d) My Cols: %d:%d (%d)\n", data->logId, data->rowStart, 
+            (data->rowStart + data->myRows) - 1, data->myRows, data->colStart, 
+            (data->colStart + data->myCols) - 1, data->myCols);
+        }
+    }
+
+    
+    //   if ParaVis animation:
+    //     (a) call your function to update the color3 buffer
+    //     (b) call draw_ready(data->handle)
+    //     (c) call usleep(SLEEP_USECS) to slow down the animation
+    else {
+        for (i = 0; i < data->iters; i++){
+            // set futureBoard
+            set_next(data);
+            pthread_barrier_wait(&myrmidon);
+            if(data->logId == 0) {
+                // update board based on set futureBoard
+                for (j = 0; j < (data->rows * data->cols); j++){
+                    data->board[j] = data->futureBoard[j];
+                }
+            }
+            pthread_barrier_wait(&myrmidon);
+            simulation(data);
+            pthread_barrier_wait(&myrmidon);
+        }
+    }
+
+    return NULL;
+}
+
+
+// Sets the state of the next board based on the current board, and then
+// sets the current board to the next board. Accepts the gol_data struct,
+// which holds our board arrays, among other things.
+int set_next(struct gol_data *data) {
+    int i, j, g, r, counter, tempCol, tempRow, timeshave, alived;
+    alived = 0;
+    for (i = (data->rowStart); i < ((data->rowStart) + (data->myRows)); i++) {
+        for (j = data->colStart; j < ((data->colStart) + (data->myCols)); j++) {
+            counter = 0;
+            timeshave = (i * data->cols) + j;
+            for (g = 0; g < 3; g++) {
+                for (r = 0; r < 3; r++) {
+                    // Uses ((i + col) % col) in order to deal with wrap-around.
+                    tempRow = (((i + g) - 1) + data->rows) % data->rows;
+                    tempCol = (((j + r) - 1) + data->cols) % data->cols;
+                    if ((data->board)[(tempRow * data->rows) + tempCol] == 1){
+                        // counting alive cells
+                        counter = counter + 1;
+                    }
+                }
+            }
+            if (data->board[timeshave] == 1){
+                // account for the living cell itself
+                counter = counter - 1;
+                if(counter <= 1 || counter >= 4) {
+                    data->futureBoard[timeshave] = 0;
+                }
+                else {
+                    data->futureBoard[timeshave] = 1;
+                    // increase found live cells amount
+                    alived++;
+                }
+            }
+            else{
+                if(counter == 3) {
+                    data->futureBoard[timeshave] = 1;
+                    // increase found live cells amount
+                    alived++;
+                }
+                else {
+                    data->futureBoard[timeshave] = 0;
+                }
+            }
+        }
+    }
+    if (alived > 0) {
+        // mutex to prevent race
+        pthread_mutex_lock(&cerberus);
+        // add found live cells to the glabal var
+        total_live += alived;
+        pthread_mutex_unlock(&cerberus);
+    }
+    
+    return 0;
+}
+
+
+/* Print the board to the terminal.
+ *   data: gol game specific data
+ *   round: the current round number
+ */
+void print_board(struct gol_data *data, int round) {
+    int i, j;
+    /* Print the round number. */
+        fprintf(stderr, "Round: %d\n", round);
+
+        for (i = 0; i < data->rows; i++) {
+            for (j = 0; j < data->cols; j++) {
+                // if cell is alive
+                if ((data->board)[(i * data->rows) + j] != 0) {
+                    if (data->output_mode == OUTPUT_ASCII) {
+                        fprintf(stderr, " @");
+                    }
+                }
+                // otherwise
+                else {
+                    if (data->output_mode == OUTPUT_ASCII) {
+                        fprintf(stderr, " .");
+                }
+                }
+            }
+            if (data->output_mode == OUTPUT_ASCII) {
+                fprintf(stderr, "\n");
+            }
+        }
+
+    /* Print the total number of live cells. */
+    
+    if (data->output_mode == OUTPUT_ASCII) {
+        fprintf(stderr, "Live cells: %d\n\n", total_live);
+    }
+    fflush(stdout);
+}
+
+
+/**********************************************************/
+/***** START: DO NOT MODIFY THIS CODE *****/
+/* initialize ParaVisi animation */
+int setup_animation(struct gol_data* data) {
+    /* connect handle to the animation */
+    int num_threads = data->numThreads;
+    data->handle = init_pthread_animation(num_threads, data->rows,
+            data->cols, visi_name);
+    if (data->handle == NULL) {
+        printf("ERROR init_pthread_animation\n");
+        exit(1);
+    }
+    // get the animation buffer
+    data->image_buff = get_animation_buffer(data->handle);
+    if(data->image_buff == NULL) {
+        printf("ERROR get_animation_buffer returned NULL\n");
+        exit(1);
+    }
+    return 0;
+}
+
+    /* sequential wrapper functions around ParaVis library functions */
+    void (*mainloop)(struct gol_data *data);
+
+    void* seq_do_something(void * args){
+        mainloop((struct gol_data *)args);
+        return 0;
+    }
+
+    int connect_animation(void (*applfunc)(struct gol_data *data),
+            struct gol_data* data)
+    {
+    pthread_t pid;
+
+    mainloop = applfunc;
+    if( pthread_create(&pid, NULL, seq_do_something, (void *)data) ) {
+        printf("pthread_created failed\n");
+        return 1;
+    }
+    return 0;
+}
+/***** END: DO NOT MODIFY THIS CODE *****/
+/******************************************************/
